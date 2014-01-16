@@ -1,55 +1,147 @@
-user <%= scope.lookupvar('nginx::config::nx_daemon_user') %>;
-worker_processes <%= @worker_processes %>;
+user www-data;
 
-error_log  <%= @nginx_error_log %>;
-pid        <%= scope.lookupvar('nginx::params::nx_pid')%>;
+error_log  /var/log/nginx/error.log;
+pid        /var/run/nginx.pid;
+
+#Aurex tuning
+worker_processes auto;
+worker_rlimit_nofile 8192;
 
 events {
-  worker_connections <%= @worker_connections -%>;
-<% if scope.lookupvar('nginx::params::nx_multi_accept') == 'on' %>multi_accept on;<% end -%>
-<% if scope.lookupvar('nginx::params::nx_events_use') %>use <%= scope.lookupvar('nginx::params::nx_events_use')%>;<% end -%>
+  worker_connections 8000;
+
+  # optmized to serve many clients with each thread, essential for linux
+  use epoll;
+
+  # accept as many connections as possible, may flood worker connections if set too low
+  multi_accept on;
 }
+# // Aurex tuning
+
 
 http {
   include       /etc/nginx/mime.types;
   default_type  application/octet-stream;
 
-  access_log  <%= @http_access_log %>;
 
-  sendfile    <%= scope.lookupvar('nginx::params::nx_sendfile')%>;
+  # Format to use in log files
+  #log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+  #                  '$status $body_bytes_sent "$http_referer" '
+  #                  '"$http_user_agent" "$http_x_forwarded_for"';
+  #access_log  /var/log/nginx/access.log main;
 
-  server_tokens <%= @server_tokens %>;
-  <% if scope.lookupvar('nginx::params::nx_tcp_nopush') == 'on' %>tcp_nopush on;<% end %>
+  access_log  /var/log/nginx/access.log;
 
-  types_hash_max_size <%= scope.lookupvar('nginx::params::nx_types_hash_max_size')%>;
-  types_hash_bucket_size <%= scope.lookupvar('nginx::params::nx_types_hash_bucket_size')%>;
+  server_tokens off;
 
-  server_names_hash_bucket_size <%= @names_hash_bucket_size %>;
-  server_names_hash_max_size <%= @names_hash_max_size %>;
 
-  keepalive_timeout  <%= scope.lookupvar('nginx::params::nx_keepalive_timeout')%>;
-  tcp_nodelay        <%= scope.lookupvar('nginx::params::nx_tcp_nodelay')%>;
+  types_hash_max_size 1024;
+  types_hash_bucket_size 512;
 
-<% if scope.lookupvar('nginx::params::nx_gzip') == 'on' %>
-  gzip         on;
+  server_names_hash_bucket_size 64;
+
+
+
+  # cache informations about FDs, frequently accessed files
+  # can boost performance, but you need to test those values
+  open_file_cache max=200000 inactive=20s;
+  open_file_cache_valid 30s;
+  open_file_cache_min_uses 2;
+  open_file_cache_errors on;
+
+  # copies data between one FD and other from within the kernel
+  # faster then read() + write()
+  sendfile on;
+
+  # send headers in one peace, its better then sending them one by one
+  tcp_nopush on;
+
+  # don't buffer data sent, good for small data bursts in real time
+  tcp_nodelay off;
+
+  # server will close connection after this time
+  keepalive_timeout 10 10;
+
+  # number of requests client can make over keep-alive -- for testing
+  keepalive_requests 100000;
+
+  # allow the server to close connection on non responding client, this will free up memory
+  reset_timedout_connection on;
+
+  # request timed out -- default 60
+  client_body_timeout 10;
+  client_header_timeout 10;
+
+  # if client stop responding, free up memory -- default 60
+  send_timeout 15;
+
+  # reduce the data that needs to be sent over network
+  gzip on;
+  # Enable compression both for HTTP/1.0 and HTTP/1.1 (required for CloudFront).
+  gzip_http_version  1.0;
+  # Compression level (1-9).
+  # 5 is a perfect compromise between size and cpu usage, offering about
+  # 75% reduction for most ascii files (almost identical to level 9).
+  gzip_comp_level    5;
+  # Don't compress anything that's already small and unlikely to shrink much
+  # if at all (the default is 20 bytes, which is bad as that usually leads to
+  # larger files after gzipping).
+  gzip_min_length 1024;
+  # Tell proxies to cache both the gzipped and regular version of a resource
+  # whenever the client's Accept-Encoding capabilities header varies;
+  # Avoids the issue where a non-gzip capable client (which is extremely rare
+  # today) would display gibberish if their proxy gave them the gzipped version.
+  gzip_vary          on;
+  # Compress data even for clients that are connecting to us via proxies,
+  # identified by the "Via" header (required for CloudFront).
+  gzip_proxied       any;
+  # Compress all output labeled with one of the following MIME-types.
+  gzip_types
+    application/atom+xml
+    application/javascript
+    application/json
+    application/rss+xml
+    application/vnd.ms-fontobject
+    application/x-font-ttf
+    application/x-web-app-manifest+json
+    application/xhtml+xml
+    application/xml
+    font/opentype
+    image/svg+xml
+    image/x-icon
+    text/css
+    text/plain
+    text/x-component;
+  # text/html is always compressed by HttpGzipModule
+
   gzip_disable "MSIE [1-6]\.(?!.*SV1)";
-<% end -%>
 
-<% if @proxy_cache_path -%>
-  proxy_cache_path    <%= @proxy_cache_path %> levels=<%= @proxy_cache_levels %> keys_zone=<%= @proxy_cache_keys_zone %> max_size=<%= @proxy_cache_max_size %> inactive=<%= @proxy_cache_inactive %>;
-<% end -%>
+  # This should be turned on if you are going to have pre-compressed copies (.gz) of
+  # static files available. If not it should be left off as it will cause extra I/O
+  # for the check. It is best if you enable this in a location{} block for
+  # a specific directory, or on an individual server{} level.
+  # gzip_static on;
 
-<% if @http_cfg_append -%><% @http_cfg_append.sort_by{|k,v| k}.each do |key,value| -%>
-  <%= key %> <%= value %>;
-<% end -%>
-<% end -%>
+
+  # Protect against the BEAST attack by preferring RC4-SHA when using SSLv3 and TLS protocols.
+  # Note that TLSv1.1 and TLSv1.2 are immune to the beast attack but only work with OpenSSL v1.0.1 and higher and has limited client support.
+  ssl_protocols              SSLv3 TLSv1 TLSv1.1 TLSv1.2;
+  ssl_ciphers                RC4:HIGH:!aNULL:!MD5;
+  ssl_prefer_server_ciphers  on;
+
+  # Optimize SSL by caching session parameters for 10 minutes. This cuts down on the number of expensive SSL handshakes.
+  # The handshake is the most CPU-intensive operation, and by default it is re-negotiated on every new/parallel connection.
+  # By enabling a cache (of type "shared between all Nginx workers"), we tell the client to re-use the already negotiated state.
+  # Further optimization can be achieved by raising keepalive_timeout, but that shouldn't be done unless you serve primarily HTTPS.
+  ssl_session_cache    shared:SSL:10m; # a 1mb cache can hold about 4000 sessions, so we can hold 40000 sessions
+  ssl_session_timeout  10m;
+
+  # This default SSL certificate will be served whenever the client lacks support for SNI (Server Name Indication).
+  # Make it a symlink to the most important certificate you have, so that users of IE 8 and below on WinXP can see your main site without SSL errors.
+  #ssl_certificate      /etc/nginx/default_ssl.crt;
+  #ssl_certificate_key  /etc/nginx/default_ssl.key;
+
 
   include /etc/nginx/conf.d/*.conf;
-  include <%= scope.lookupvar('nginx::params::nx_conf_dir') %>/sites-enabled/*;
 
 }
-<% if scope.lookupvar('nginx::mail') %>
-mail {
-  include /etc/nginx/conf.mail.d/*.conf;
-}
-<% end -%>
